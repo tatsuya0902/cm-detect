@@ -9,6 +9,8 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 
+import { decideByCaptions } from "./caption-decide";
+import { captionActivity, captionCoverage } from "./captions";
 import { decideCm, missingVideo, totalLength, type Range } from "./core/cm-decide";
 import { LogoSession } from "./logo";
 import { scanFile } from "./scan";
@@ -117,6 +119,14 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
 
   const { times } = found;
   const duration = probed.duration;
+  // 字幕の流れ (ロゴが使えないときの判定材料)。取れなければ null
+  // 2026-11-15 の実測で、バラエティ・ニュースでは本編でも字幕が途切れるため
+  // 「字幕の空白 = CM」が成り立たず、合流させると誤検出・見落としが増えた。
+  // そのため既定では使わず、環境変数 CM_DETECT_CAPTIONS=1 のときだけ有効にする
+  // (ロゴを出さない局のドラマなど、効く素材が来たときの実験用に残してある)
+  const captions = process.env.CM_DETECT_CAPTIONS === "1"
+    ? await captionActivity(input).catch(() => null)
+    : null;
   const at = (frame: number) => (frame < times.length ? times[frame]! : duration);
   const missing = missingVideo(Float64Array.from(times), duration);
   const share = (cm: Range[]) => totalLength(cm) / Math.max(1, duration - totalLength(missing));
@@ -149,7 +159,31 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
   }
   if (cm.length === 0) {
     const plain = decideCm(base);
-    if (plain.length > 0 && share(plain) < 0.5) {
+    if (captions !== null) {
+      const viaCaptions = decideByCaptions({
+        duration,
+        silences: found.silences,
+        active: captions,
+      });
+      /*
+       * 字幕入り CM 対策: 字幕付きの CM は「字幕の空白」にならないので、
+       * 尺だけで拾えた区間のうち字幕の密度が低いものは、字幕が流れていても採る。
+       * 逆に字幕が密な区間は、尺が合っていても本編の無言場面の可能性が高いので落とす
+       */
+      const extra = plain.filter(
+        (b) =>
+          !viaCaptions.some((c) => b.start < c.end && c.start < b.end) &&
+          captionCoverage(captions, b) < 0.35,
+      );
+      const merged = [...viaCaptions, ...extra].sort((a, b) => a.start - b.start);
+      if (merged.length > 0 && share(merged) < 0.5) {
+        cm = merged;
+        note = `${note}${note ? " / " : ""}字幕の空白と尺で判定`;
+      }
+    }
+    if (cm.length > 0) {
+      // 字幕経由で決まった
+    } else if (plain.length > 0 && share(plain) < 0.5) {
       cm = plain;
       note = `${note}${note ? " / " : ""}無音と尺で判定`;
     } else if (plain.length > 0) {
