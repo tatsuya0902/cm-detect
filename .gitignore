@@ -1,0 +1,5 @@
+dist/
+models/
+state.json
+node_modules/
+*.png
