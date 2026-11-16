@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 
 import type { Range } from "./core/cm-decide";
 import { DETECTOR_VERSION, detect, diagnose, type DetectStatus } from "./detect";
+import { checkRecordingGuard, guardConfigFromEnv } from "./guard";
 import {
   assessStage,
   loadRegistry,
@@ -272,6 +273,24 @@ async function runBatch(args: string[]): Promise<void> {
     console.log("[batch] 既に実行中のため終了します");
     return;
   }
+  // 録画ガード: 録画中・録画開始直前は動かない (CM 検出は遅れても困らない)
+  const guardConfig = guardConfigFromEnv(process.env);
+  const releaseLock = () => {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // ロックが既に無い
+    }
+  };
+  if (guardConfig.enabled) {
+    const first = await checkRecordingGuard(guardConfig);
+    if (first.blocked) {
+      console.log(`[batch] スキップ: ${first.reason}`);
+      releaseLock();
+      return;
+    }
+  }
+
   const serverDir = argValue(args, "--server-dir") ?? "";
   const python = argValue(args, "--python") ?? (serverDir ? join(serverDir, ".venv/bin/python") : "");
   const script = argValue(args, "--detector-script") ?? join(HOME, "run_cm_detector.py");
@@ -312,6 +331,15 @@ async function runBatch(args: string[]): Promise<void> {
     if (duration < 120) continue;
     // 録画直後のファイルは安定するまで待つ
     if (Date.now() - statSync(file).mtimeMs < 180000) continue;
+
+    // 処理の途中で録画が始まっていたら、残りは次回タイマーに回す
+    if (guardConfig.enabled) {
+      const guard = await checkRecordingGuard(guardConfig);
+      if (guard.blocked) {
+        console.log(`[batch] 中断: ${guard.reason} (残りは次回に回します)`);
+        break;
+      }
+    }
 
     const chapterPath = file.replace(/\.[^.]+$/, ".chapter.txt");
     const attempts =
@@ -390,11 +418,7 @@ async function runBatch(args: string[]): Promise<void> {
     }
   }
   console.log(`[batch] 完了 (${done} 件処理)`);
-  try {
-    unlinkSync(lockPath);
-  } catch {
-    // ロックが既に無い
-  }
+  releaseLock();
 }
 
 const [command, ...rest] = process.argv.slice(2);

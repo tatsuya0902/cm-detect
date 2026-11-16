@@ -56,6 +56,20 @@ node dist/cm-detect.mjs batch --models <型の置き場> \
 AKAGI では systemd のユーザータイマー (cm-detect.timer、15 分ごと) が
 バッチを回している。状態は `state.json` (処理済みファイルの一覧)。
 
+## 録画ガード
+
+バッチは開始時と各録画の処理開始前に EPGStation の API を確認し、
+録画中、または 10 分以内に予約の開始がある場合はその回を静かに
+終了する (残りは次回タイマーに回す)。録画中の負荷でチューナーの
+読み出しが止まり録画が欠ける事故 (2026-11-16) への対策で、CM 検出は
+遅れても困らない処理なので競合させない。API に到達できない場合も
+今回はスキップする (fail-closed)。
+
+- `CM_DETECT_RECORDING_GUARD=0`: ガードを無効化
+- `CM_DETECT_GUARD_WINDOW_MIN=N`: 予約開始の窓 (分、既定 10)
+- `CM_DETECT_EPGSTATION_API=URL`: EPGStation の API ベース
+  (既定 `http://127.0.0.1:8888`)
+
 ## 検出器の版 2026-11-16.2 で入れたもの
 
 - **材料の完全性チェック**: ロゴ枠のバイト数・コマ数・メタデータ側のコマ数が
