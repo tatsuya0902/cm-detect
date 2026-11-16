@@ -209,6 +209,8 @@ export interface LogoResult {
   scores: Float32Array;
   /** 覚え書き */
   note: string;
+  /** 型がこの録画から覚えた (覚え直した) ものか。台帳への記録用 */
+  learnedNow: boolean;
 }
 
 /**
@@ -268,12 +270,16 @@ export class LogoSession {
    * 区間を出す。覚えていた型で 1 コマも当たらなければ、この録画から覚え直して
    * 枠だけ読み直す (rescan)。覚え直した型の在り処が前と重ならなければ持ち帰らない
    */
-  async finish(fps: number, rescan: (logo: ScanLogo) => Promise<number>): Promise<LogoResult> {
+  async finish(
+    fps: number,
+    rescan: (logo: ScanLogo) => Promise<{ code: number; logoFrames: number; frames: number }>,
+  ): Promise<LogoResult> {
     const fail = (note: string, code = 1): LogoResult => ({
       code,
       spans: [],
       scores: new Float32Array(),
       note,
+      learnedNow: this.learnedNow,
     });
     let spans = this.current.spans(fps);
     let keep = true;
@@ -286,8 +292,14 @@ export class LogoSession {
       this.learnedNow = true;
       const next = tracker(learned, this.video);
       if (typeof next === "string") return fail(next);
-      const code = await rescan(next.scan);
-      if (code !== 0) return fail(`コマを取り出せませんでした (code ${code})`, code);
+      const again = await rescan(next.scan);
+      if (again.code !== 0) return fail(`コマを取り出せませんでした (code ${again.code})`, again.code);
+      // 読み直した材料も完全性を確認する。数が合わない材料で型を持ち帰らない
+      if (again.frames === 0 || again.logoFrames !== again.frames) {
+        return fail(
+          `読み直したロゴの枠の数 (${again.logoFrames}) とコマの数 (${again.frames}) が合いません`,
+        );
+      }
       this.current = next;
       spans = next.spans(fps);
     }
@@ -305,6 +317,7 @@ export class LogoSession {
       spans,
       scores: this.current.scores(),
       note: `${where} / ロゴ ${share}%${how}`,
+      learnedNow: this.learnedNow && keep,
     };
   }
 }

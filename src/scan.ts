@@ -42,6 +42,15 @@ export interface ScanResult {
   silences: Range[];
   /** 届いたロゴ枠の数 */
   logoFrames: number;
+  /** ロゴ枠として標準出力から受けた総バイト数 (材料の完全性の記録用) */
+  logoBytes: number;
+  /**
+   * 材料の完全性。ロゴ枠のバイト列が「コマ数 × 1 コマの大きさ + 端数 (1 コマ未満)」
+   * になっていて、コマ数とメタデータ側のコマ数が一致するときだけ ok。
+   * 欠けた材料で型を育てたり判定したりしないための受け入れ確認
+   * (負荷時に枠とコマの数がずれた実測を受けたもの。ずれの機構そのものは未確定)
+   */
+  integrity: { ok: boolean; reason?: string };
 }
 
 const FRAME_TIME = /pts_time:\s*(-?[\d.]+)/;
@@ -134,6 +143,7 @@ export async function scanFile(input: string, options: ScanOptions = {}): Promis
   }
 
   let logoFrames = 0;
+  let logoBytes = 0;
   const feed = logo
     ? framer(logo.size, (bytes) => {
         logo.onFrame(bytes, logoFrames);
@@ -147,7 +157,10 @@ export async function scanFile(input: string, options: ScanOptions = {}): Promis
     let errBytes = 0;
     const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
     proc.stdout.on("data", (chunk: Buffer) => {
-      if (feed) feed(chunk);
+      if (feed) {
+        logoBytes += chunk.length;
+        feed(chunk);
+      }
     });
     proc.stderr.on("data", (chunk: Buffer) => {
       errBytes += chunk.length;
@@ -167,5 +180,24 @@ export async function scanFile(input: string, options: ScanOptions = {}): Promis
   const end = times.length > 0 ? times[times.length - 1]! : Number.NaN;
   const silences = audio ? parseSilences(readQuiet(silencesFile), end) : [];
   rmSync(dir, { recursive: true, force: true });
-  return { code, stderr: stderr.slice(-2000), times, cuts, silences, logoFrames };
+
+  // 完全性の受け入れ確認: 段階ごとの件数が一致しなければ材料を信用しない
+  let integrity: ScanResult["integrity"] = { ok: true };
+  if (logo) {
+    const leftover = logoBytes - logoFrames * logo.size;
+    if (code !== 0) {
+      integrity = { ok: false, reason: `scan code ${code}` };
+    } else if (leftover < 0 || leftover >= logo.size) {
+      integrity = {
+        ok: false,
+        reason: `ロゴ枠のバイト列が合いません (bytes ${logoBytes} / frames ${logoFrames} / size ${logo.size})`,
+      };
+    } else if (logoFrames !== times.length) {
+      integrity = {
+        ok: false,
+        reason: `ロゴの枠の数 (${logoFrames}) とコマの数 (${times.length}) が合いません`,
+      };
+    }
+  }
+  return { code, stderr: stderr.slice(-2000), times, cuts, silences, logoFrames, logoBytes, integrity };
 }

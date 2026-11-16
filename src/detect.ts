@@ -9,13 +9,24 @@
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 
+import { auditLogoEvidence, perSecondScores, type LogoAudit } from "./audit";
 import { decideByCaptions } from "./caption-decide";
 import { captionActivity, captionCoverage } from "./captions";
 import { boundaries, decideCm, missingVideo, totalLength, type Range } from "./core/cm-decide";
 import { LogoSession } from "./logo";
+import { loadRegistry, modelKey, recordLearning, recordUsage } from "./models-registry";
 import { scanFile, type ScanResult } from "./scan";
 
 const FFPROBE = process.env.FFPROBE_PATH || "ffprobe";
+
+/**
+ * 検出器の版。判定の挙動を変えたら上げる。
+ * 状態ファイルの degraded / failed は、版が変わると 1 回だけ再処理される。
+ */
+export const DETECTOR_VERSION = "2026-11-16.2";
+
+/** シーンチェンジとみなす scdet の下限 (core/cm-decide の CUT_MIN と同じ) */
+const SCENE_CUT_MIN = 8;
 
 export interface Probe {
   width: number;
@@ -94,6 +105,8 @@ export interface DetectMaterial {
   silences: number;
   /** 届いたロゴ枠の数 */
   logoFrames: number;
+  /** ロゴ枠として受けた総バイト数 */
+  logoBytes: number;
   /** ロゴの点が付いたコマ数 (ロゴ判定ができていれば) */
   logoScores: number;
 }
@@ -109,6 +122,34 @@ export interface DetectResult {
   /** 状態の根拠 (短い日本語) */
   statusReason: string;
   material: DetectMaterial;
+  /** ロゴ材料の監査 (ロゴが使えたときだけ。要確認区間の抽出で、判定には使わない) */
+  audit: LogoAudit | null;
+}
+
+/**
+ * ロゴ材料から監査を作る。対象はコマが実在した秒まで (perSecondScores の長さ) で、
+ * 区間と切れ目はそこへ切りそろえる (範囲外の材料で監査を不正にしないため)。
+ */
+function computeAudit(
+  found: ScanResult,
+  logoSpansSec: Range[],
+  scores: Float32Array,
+  duration: number,
+): LogoAudit | null {
+  const perSecond = perSecondScores(found.times, scores, duration);
+  if (perSecond === null) return null;
+  const covered = perSecond.length;
+  const clip = (ranges: readonly Range[]): Range[] =>
+    ranges
+      .filter((r) => r.start < covered)
+      .map((r) => ({ start: r.start, end: Math.min(r.end, covered) }));
+  return auditLogoEvidence({
+    duration: covered,
+    scores: perSecond,
+    logoOn: clip(logoSpansSec),
+    silences: clip(found.silences),
+    scenes: found.times.filter((t, i) => t < covered && (found.cuts[i] ?? 0) >= SCENE_CUT_MIN),
+  });
 }
 
 export async function detect(input: string, options: DetectOptions): Promise<DetectResult> {
@@ -119,25 +160,39 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
 
   let logo: { spans: Array<{ start: number; end: number }>; scores: Float32Array } | null = null;
   let logoNote = "";
+  let logoLearnedNow = false;
+  let audit: LogoAudit | null = null;
   // ロゴがどうなったか: used=使えた / discarded=結果をガードで捨てた /
-  // unavailable=覚えられなかった / mismatch=枠とコマの数が合わない / failed=判定に失敗
-  let logoState: "used" | "discarded" | "unavailable" | "mismatch" | "failed" = "unavailable";
-  const session = await LogoSession.open(input, video, repo, timeoutMs);
+  // unavailable=覚えられなかった / mismatch=枠とコマの数が合わない / failed=判定に失敗 /
+  // quarantined=台帳で隔離中
+  let logoState: "used" | "discarded" | "unavailable" | "mismatch" | "failed" | "quarantined" =
+    "unavailable";
+  // 隔離中の型は検出に使わない (誤認が確認された型を通常運用から外す)
+  const registryEntry = loadRegistry(options.modelsDir).models[
+    modelKey(options.channelKey, probed.width, probed.height)
+  ];
+  const quarantined = registryEntry?.status === "quarantined";
+  const session = quarantined ? null : await LogoSession.open(input, video, repo, timeoutMs);
   let found;
-  if (typeof session === "string") {
+  if (quarantined) {
+    logoNote = "ロゴの型は台帳で隔離中のため使いませんでした";
+    logoState = "quarantined";
+    found = await scanFile(input, { logo: null, timeoutMs });
+  } else if (typeof session === "string" || session === null) {
     logoNote = `ロゴを覚えられませんでした: ${session}`;
     found = await scanFile(input, { logo: null, timeoutMs });
   } else {
     found = await scanFile(input, { logo: session.scanLogo(), timeoutMs });
-    if (found.times.length > 0 && found.logoFrames === found.times.length) {
+    if (found.times.length > 0 && found.integrity.ok) {
       const result = await session.finish(probed.fps, async (again) => {
         const rescan = await scanFile(input, { logo: again, audio: false, timeoutMs });
-        return rescan.code;
+        return { code: rescan.code, logoFrames: rescan.logoFrames, frames: rescan.times.length };
       });
       if (result.code === 0) {
         logo = { spans: result.spans, scores: result.scores };
         logoNote = result.note;
         logoState = "used";
+        logoLearnedNow = result.learnedNow;
       } else {
         logoNote = `ロゴ判定に失敗: ${result.note}`;
         logoState = "failed";
@@ -145,7 +200,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     } else {
       // 枠とコマの対応が取れない材料でロゴ判定を続けるのは危険 (途中で欠けたコマが
       // あれば、それ以降の対応が全部ずれる) ため、ロゴだけを無効化して残りの材料で決める
-      logoNote = `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
+      logoNote = found.integrity.reason ?? `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
       logoState = "mismatch";
     }
   }
@@ -162,6 +217,26 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     : null;
   const at = (frame: number) => (frame < times.length ? times[frame]! : duration);
   const missing = missingVideo(Float64Array.from(times), duration);
+
+  // ロゴ材料の監査と、型の台帳への記録 (どちらも判定には使わない。失敗しても検出は続ける)
+  if (logo !== null) {
+    try {
+      const logoSec = logo.spans.map((s) => ({ start: at(s.start), end: at(s.end + 1) }));
+      audit = computeAudit(found, logoSec, logo.scores, duration);
+      if (logoLearnedNow) {
+        recordLearning(options.modelsDir, options.channelKey, probed.width, probed.height, input);
+      }
+      recordUsage(options.modelsDir, options.channelKey, probed.width, probed.height, {
+        file: input,
+        kind: logoLearnedNow ? "training" : "use",
+        coverage: totalLength(logoSec) / Math.max(1, duration),
+        auditReasons: audit ? [...audit.reasons] : [],
+        detectorVersion: DETECTOR_VERSION,
+      });
+    } catch (error) {
+      console.warn(`[cm] 監査・台帳への記録に失敗: ${error}`);
+    }
+  }
   const share = (cm: Range[]) => totalLength(cm) / Math.max(1, duration - totalLength(missing));
   const base = {
     duration,
@@ -239,6 +314,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     cuts: found.cuts.length,
     silences: found.silences.length,
     logoFrames: found.logoFrames,
+    logoBytes: found.logoBytes,
     logoScores: logo?.scores.length ?? 0,
   };
   let status: DetectStatus;
@@ -266,7 +342,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     status = "degraded";
     statusReason = `ロゴが使えず (${logoState})、残りの材料でも CM を決められなかった`;
   }
-  return { cm, duration, note, logoNote, status, statusReason, material };
+  return { cm, duration, note, logoNote, status, statusReason, material, audit };
 }
 
 export interface DiagnoseOptions extends DetectOptions {
@@ -296,10 +372,10 @@ export async function diagnose(input: string, options: DiagnoseOptions): Promise
     found = await scanFile(input, { logo: null, timeoutMs });
   } else {
     found = await scanFile(input, { logo: session.scanLogo(), timeoutMs });
-    if (found.times.length > 0 && found.logoFrames === found.times.length) {
+    if (found.times.length > 0 && found.integrity.ok) {
       const result = await session.finish(probed.fps, async (again) => {
         const rescan = await scanFile(input, { logo: again, audio: false, timeoutMs });
-        return rescan.code;
+        return { code: rescan.code, logoFrames: rescan.logoFrames, frames: rescan.times.length };
       });
       if (result.code === 0) {
         logo = { spans: result.spans, scores: result.scores };
@@ -308,7 +384,7 @@ export async function diagnose(input: string, options: DiagnoseOptions): Promise
         logoNote = `ロゴ判定に失敗: ${result.note}`;
       }
     } else {
-      logoNote = `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
+      logoNote = found.integrity.reason ?? `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
     }
   }
 
@@ -361,6 +437,10 @@ export async function diagnose(input: string, options: DiagnoseOptions): Promise
       : null;
   const plain = decideCm(base);
 
+  // 録画全体のロゴ材料の監査 (要確認区間の抽出。診断用で判定には使わない)
+  const audit: LogoAudit | null =
+    logo !== null ? computeAudit(found, logoSpansSec, logo.scores, duration) : null;
+
   return {
     file: input,
     duration,
@@ -382,6 +462,7 @@ export async function diagnose(input: string, options: DiagnoseOptions): Promise
     boundariesAlone: boundaries(base, 0.8).filter(inWindow).map(dumpBoundary),
     logoSpansInWindow: logoSpansSec.filter((s) => s.end >= win.start - 10 && s.start <= win.end + 10),
     logoScoreBySecond: scoreBySecond,
+    audit,
     resultWithLogo: withLogo,
     resultPlain: plain,
   };

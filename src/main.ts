@@ -14,19 +14,19 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Range } from "./core/cm-decide";
-import { detect, diagnose, type DetectStatus } from "./detect";
-
-/**
- * 検出器の版。判定の挙動を変えたら上げる。
- * 状態ファイルの degraded / failed は、版が変わると 1 回だけ再処理される。
- */
-const DETECTOR_VERSION = "2026-11-16.1";
+import { DETECTOR_VERSION, detect, diagnose, type DetectStatus } from "./detect";
+import {
+  assessStage,
+  loadRegistry,
+  setModelStatus,
+  type ModelStatus,
+} from "./models-registry";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
@@ -100,9 +100,42 @@ async function runDetect(args: string[]): Promise<void> {
       status: result.status,
       statusReason: result.statusReason,
       material: result.material,
+      audit: result.audit,
       chapter: out ?? null,
     }),
   );
+}
+
+// ---------------- 型の台帳 ----------------
+
+function runModels(args: string[]): void {
+  const models = argValue(args, "--models") ?? DEFAULT_MODELS;
+  const registry = loadRegistry(models);
+  const entries = Object.entries(registry.models).sort((a, b) => a[0].localeCompare(b[0]));
+  if (entries.length === 0) {
+    console.log("台帳に型はありません");
+    return;
+  }
+  for (const [key, entry] of entries) {
+    const { stage, validations } = assessStage(entry);
+    console.log(
+      `${key} v${entry.version} [${entry.status}] stage=${stage} validations=${validations} usages=${entry.usages.length}` +
+        (entry.trainedFrom ? ` trained=${entry.trainedFrom}` : ""),
+    );
+  }
+}
+
+function runModelStatus(args: string[], status: ModelStatus): void {
+  const models = argValue(args, "--models") ?? DEFAULT_MODELS;
+  const channel = (argValue(args, "--channel") ?? "").replace(/[^\w.-]+/g, "_");
+  const sizeArg = argValue(args, "--size") ?? "";
+  const size = /^(\d+)x(\d+)$/.exec(sizeArg);
+  if (!channel || !size) {
+    throw new Error("--channel <キー> --size <幅>x<高さ> を指定してください");
+  }
+  const entry = setModelStatus(models, channel, Number(size[1]), Number(size[2]), status);
+  if (!entry) throw new Error("台帳にその型がありません (検出で使われると登録されます)");
+  console.log(`${channel} ${sizeArg}: status -> ${status}`);
 }
 
 async function runDiagnose(args: string[]): Promise<void> {
@@ -153,6 +186,12 @@ interface StateEntry {
   attempts?: number;
   /** 処理した検出器の版 */
   v?: string;
+  /** ロゴ材料の監査の要約 (要確認区間。人手確認の入口) */
+  audit?: {
+    reasons: string[];
+    suspiciousOnsets: number[];
+    reviewWindows: Range[];
+  };
 }
 
 interface StateFile {
@@ -195,10 +234,44 @@ function runIngest(
   });
 }
 
+/** バッチの同時実行を 1 つに絞るためのロック。持ち主の pid を書き、死んでいたら奪う */
+function acquireLock(lockPath: string): boolean {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      return true;
+    } catch {
+      let alive = false;
+      try {
+        const pid = Number(readFileSync(lockPath, "utf8"));
+        if (Number.isFinite(pid) && pid > 0) {
+          process.kill(pid, 0);
+          alive = true;
+        }
+      } catch {
+        alive = false;
+      }
+      if (alive) return false;
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
 async function runBatch(args: string[]): Promise<void> {
   const api = argValue(args, "--api") ?? "http://127.0.0.77:7010";
   const models = argValue(args, "--models") ?? DEFAULT_MODELS;
   const statePath = argValue(args, "--state") ?? join(HERE, "state.json");
+  // 同時実行は 1 つだけ (タイマーと手動実行が重なると、材料も型の育成も競合する)
+  const lockPath = `${statePath}.lock`;
+  if (!acquireLock(lockPath)) {
+    console.log("[batch] 既に実行中のため終了します");
+    return;
+  }
   const serverDir = argValue(args, "--server-dir") ?? "";
   const python = argValue(args, "--python") ?? (serverDir ? join(serverDir, ".venv/bin/python") : "");
   const script = argValue(args, "--detector-script") ?? join(HOME, "run_cm_detector.py");
@@ -267,6 +340,13 @@ async function runBatch(args: string[]): Promise<void> {
         console.log(
           `[batch] 結果: CM ${result.cm.length} 区間 [${result.status}: ${result.statusReason}] / ${result.note}`,
         );
+        if (result.audit && result.audit.suspiciousOnsets.length > 0) {
+          console.log(
+            `[batch] 要確認区間: ${result.audit.reviewWindows
+              .map((r) => `${Math.round(r.start)}-${Math.round(r.end)}s`)
+              .join(", ")}`,
+          );
+        }
         if (result.cm.length > 0) {
           writeFileSync(chapterPath, chapterText(result.cm, result.duration), "utf8");
         }
@@ -277,6 +357,15 @@ async function runBatch(args: string[]): Promise<void> {
           status: result.status,
           attempts,
           v: DETECTOR_VERSION,
+          ...(result.audit
+            ? {
+                audit: {
+                  reasons: [...result.audit.reasons],
+                  suspiciousOnsets: [...result.audit.suspiciousOnsets],
+                  reviewWindows: result.audit.reviewWindows.map((r) => ({ ...r })),
+                },
+              }
+            : {}),
         };
         saveState();
       }
@@ -301,6 +390,11 @@ async function runBatch(args: string[]): Promise<void> {
     }
   }
   console.log(`[batch] 完了 (${done} 件処理)`);
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    // ロックが既に無い
+  }
 }
 
 const [command, ...rest] = process.argv.slice(2);
@@ -308,8 +402,14 @@ try {
   if (command === "detect") await runDetect(rest);
   else if (command === "diagnose") await runDiagnose(rest);
   else if (command === "batch") await runBatch(rest);
+  else if (command === "models") runModels(rest);
+  else if (command === "model-promote") runModelStatus(rest, "promoted");
+  else if (command === "model-quarantine") runModelStatus(rest, "quarantined");
+  else if (command === "model-release") runModelStatus(rest, "provisional");
   else {
-    console.error("使い方: cm-detect.mjs detect <録画TS> --channel <キー> | diagnose <録画TS> --channel <キー> [--window 開始-終了] | batch");
+    console.error(
+      "使い方: cm-detect.mjs detect <録画TS> --channel <キー> | diagnose <録画TS> --channel <キー> [--window 開始-終了] | batch | models | model-promote/model-quarantine/model-release --channel <キー> --size <幅>x<高さ>",
+    );
     process.exit(2);
   }
 } catch (error) {

@@ -418,9 +418,9 @@ const PER_SILENCE = 4;
 
 /**
  * 候補の種類。`mark` は無音の中、`end` は録画の先頭と末尾、`bare` は無音の外の強い切れ目、`logo` はロゴの出入りそのもの、
- * `start` は番組表どおりの先頭の近くの、無音の外の強い切れ目
+ * `start` は番組表どおりの先頭の近くの、無音の外の強い切れ目、`cut` は無音の無い強い切れ目 (無音が乏しい素材用)
  */
-type Kind = "mark" | "end" | "bare" | "logo" | "start";
+type Kind = "mark" | "end" | "bare" | "logo" | "start" | "cut";
 
 interface Candidate {
   at: number;
@@ -440,6 +440,8 @@ interface Candidate {
  * - 最初のロゴの出始めと最後の消え際 (`logo`)。録画の先頭と末尾の CM の端にだけ使う (前後の番組との境目は無音を挟まないことがある)
  * - 番組表どおりの先頭から前後 `HEAD_GRACE` 秒の、無音の外の強い切れ目 (`start`)。録画の先頭からそこまでに無音の候補が
  *   1 つも無いときだけ。録画の先頭の CM の終わりと、そこから続く 15 秒の倍数の CM の先頭にだけ使う (`START_CUT`)
+ * - 無音の無い強い切れ目 (`cut`)。無音が乏しい素材でも境目の置き場所を用意するためのもので、無音の長さは持たない。
+ *   ふつうの CM の境目として使うが、無音ぶんの減点は満額かかる
  */
 function candidates(
   input: CmInput,
@@ -502,6 +504,41 @@ function candidates(
       if (cuts[i]! >= START_CUT && times[i]! < duration)
         out.push({ at: times[i]!, cut: cuts[i]!, silence: 0, kind: "start" });
   }
+  /*
+   * 無音の無い強い切れ目 (`cut`)。無音が乏しい素材では、CM の継ぎ目に無音が重ならないことがある
+   * (実測で 3600 秒に無音 17 件という録画があった)。無音の長さを持たない (silence=0) ので、
+   * 境目の減点は無音ぶんが満額かかり、切れ目の強さだけで無音の中の候補と競う。候補を置けることが
+   * 証拠になるわけではない点に注意 (誤認したロゴを覆す力はない)。
+   * 既存の候補と 0.5 秒以内で重なるものは作らない。数が暴れないよう、5 分ごとに最大 50、
+   * 全体で 1 時間あたり 600 を上限に、時刻の順で均等に間引く (計算量の制限であって精度の規則ではない)
+   */
+  if (times !== undefined && cuts !== undefined) {
+    const taken = out.map((c) => c.at).sort((a, b) => a - b);
+    const nearTaken = (t: number) => {
+      const k = lowerBound(taken, t - 0.5);
+      return k < taken.length && taken[k]! < t + 0.5;
+    };
+    const thin = (list: Candidate[], cap: number): Candidate[] => {
+      if (list.length <= cap) return list;
+      const kept: Candidate[] = [];
+      for (let i = 0; i < cap; i++) kept.push(list[Math.floor((i * list.length) / cap)]!);
+      return kept;
+    };
+    const buckets = new Map<number, Candidate[]>();
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i]!;
+      if (t <= 0 || t >= duration || cuts[i]! < CUT_MIN || nearTaken(t)) continue;
+      const bucket = Math.floor(t / 300);
+      const list = buckets.get(bucket) ?? [];
+      list.push({ at: t, cut: cuts[i]!, silence: 0, kind: "cut" });
+      buckets.set(bucket, list);
+    }
+    let added: Candidate[] = [];
+    for (const list of buckets.values()) added.push(...thin(list, 50));
+    added.sort((a, b) => a.at - b.at);
+    added = thin(added, Math.max(60, Math.ceil(duration / 3600) * 600));
+    out.push(...added);
+  }
   const first = logo[0];
   const last = logo.at(-1);
   if (first !== undefined && first.start > EDGE)
@@ -511,7 +548,7 @@ function candidates(
   out.sort((a, b) => a.at - b.at);
   // 同じ時刻は 1 つに (無音が重なっていた・ロゴの出入りが切れ目と同じ)。強いほうを残す
   const merged: Candidate[] = [{ at: 0, cut: 0, silence: 0, kind: "end" }];
-  const rank = { end: 4, mark: 3, bare: 2, start: 1, logo: 0 };
+  const rank = { end: 4, mark: 3, bare: 2, start: 1, cut: 1, logo: 0 };
   for (const c of out) {
     const prev = merged.at(-1)!;
     if (c.at - prev.at < 1e-3) {
