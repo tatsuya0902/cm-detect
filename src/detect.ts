@@ -11,9 +11,9 @@ import { join } from "node:path";
 
 import { decideByCaptions } from "./caption-decide";
 import { captionActivity, captionCoverage } from "./captions";
-import { decideCm, missingVideo, totalLength, type Range } from "./core/cm-decide";
+import { boundaries, decideCm, missingVideo, totalLength, type Range } from "./core/cm-decide";
 import { LogoSession } from "./logo";
-import { scanFile } from "./scan";
+import { scanFile, type ScanResult } from "./scan";
 
 const FFPROBE = process.env.FFPROBE_PATH || "ffprobe";
 
@@ -77,6 +77,27 @@ export interface DetectOptions {
   timeoutMs?: number;
 }
 
+/**
+ * 判定の状態。失敗を「CM ゼロ」と同じ記録にしないために分ける。
+ * - ok: 有効な材料で判定が完了した (CM ゼロも含む)
+ * - degraded: ロゴなどが使えず、残りの材料で判定した (CM ゼロも含む)
+ * - failed: 判定に必要な材料を確保できなかった
+ */
+export type DetectStatus = "ok" | "degraded" | "failed";
+
+/** 取れた材料の量 (診断と状態記録用) */
+export interface DetectMaterial {
+  scanCode: number;
+  /** コマごとの時刻が取れた数 */
+  frames: number;
+  cuts: number;
+  silences: number;
+  /** 届いたロゴ枠の数 */
+  logoFrames: number;
+  /** ロゴの点が付いたコマ数 (ロゴ判定ができていれば) */
+  logoScores: number;
+}
+
 export interface DetectResult {
   cm: Range[];
   duration: number;
@@ -84,6 +105,10 @@ export interface DetectResult {
   note: string;
   /** ロゴ判定の覚え書き (失敗理由を含む) */
   logoNote: string;
+  status: DetectStatus;
+  /** 状態の根拠 (短い日本語) */
+  statusReason: string;
+  material: DetectMaterial;
 }
 
 export async function detect(input: string, options: DetectOptions): Promise<DetectResult> {
@@ -94,6 +119,9 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
 
   let logo: { spans: Array<{ start: number; end: number }>; scores: Float32Array } | null = null;
   let logoNote = "";
+  // ロゴがどうなったか: used=使えた / discarded=結果をガードで捨てた /
+  // unavailable=覚えられなかった / mismatch=枠とコマの数が合わない / failed=判定に失敗
+  let logoState: "used" | "discarded" | "unavailable" | "mismatch" | "failed" = "unavailable";
   const session = await LogoSession.open(input, video, repo, timeoutMs);
   let found;
   if (typeof session === "string") {
@@ -109,11 +137,16 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
       if (result.code === 0) {
         logo = { spans: result.spans, scores: result.scores };
         logoNote = result.note;
+        logoState = "used";
       } else {
         logoNote = `ロゴ判定に失敗: ${result.note}`;
+        logoState = "failed";
       }
     } else {
+      // 枠とコマの対応が取れない材料でロゴ判定を続けるのは危険 (途中で欠けたコマが
+      // あれば、それ以降の対応が全部ずれる) ため、ロゴだけを無効化して残りの材料で決める
       logoNote = `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
+      logoState = "mismatch";
     }
   }
 
@@ -141,6 +174,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
 
   let cm: Range[] = [];
   let note = "";
+  let decidedBy: "logo" | "plain" | "captions" | "none" = "none";
   if (logo !== null) {
     const withLogo = decideCm({
       ...base,
@@ -150,7 +184,9 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     if (withLogo.length > 0 && share(withLogo) < 0.5) {
       cm = withLogo;
       note = `ロゴで判定 (${logoNote})`;
+      decidedBy = "logo";
     } else {
+      logoState = "discarded";
       note =
         withLogo.length === 0
           ? `ロゴの消えている所がありませんでした (${logoNote})`
@@ -179,6 +215,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
       if (merged.length > 0 && share(merged) < 0.5) {
         cm = merged;
         note = `${note}${note ? " / " : ""}字幕の空白と尺で判定`;
+        decidedBy = "captions";
       }
     }
     if (cm.length > 0) {
@@ -186,6 +223,7 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     } else if (plain.length > 0 && share(plain) < 0.5) {
       cm = plain;
       note = `${note}${note ? " / " : ""}無音と尺で判定`;
+      decidedBy = "plain";
     } else if (plain.length > 0) {
       note = `${note}${note ? " / " : ""}尺だけの判定も CM の割合が過半のため捨てました`;
     } else {
@@ -193,5 +231,158 @@ export async function detect(input: string, options: DetectOptions): Promise<Det
     }
     if (logo === null && logoNote) note = `${logoNote} / ${note}`;
   }
-  return { cm, duration, note, logoNote };
+
+  // 状態の分類: 失敗を「CM ゼロ」と同じ扱いにしない
+  const material: DetectMaterial = {
+    scanCode: found.code,
+    frames: found.times.length,
+    cuts: found.cuts.length,
+    silences: found.silences.length,
+    logoFrames: found.logoFrames,
+    logoScores: logo?.scores.length ?? 0,
+  };
+  let status: DetectStatus;
+  let statusReason: string;
+  if (found.code !== 0 || found.times.length === 0) {
+    status = "failed";
+    statusReason = `材料が取れませんでした (scan code ${found.code} / コマ ${found.times.length})`;
+  } else if (decidedBy === "logo") {
+    status = "ok";
+    statusReason = "ロゴで判定";
+  } else if (decidedBy !== "none") {
+    status = logoState === "used" ? "ok" : "degraded";
+    statusReason =
+      logoState === "used" ? "ロゴの裏付け付きで判定" : `ロゴが使えず (${logoState}) 残りの材料で判定`;
+  } else if (logoState === "discarded") {
+    status = "degraded";
+    statusReason = "ロゴ・尺の両方の結果をガードで捨てた";
+  } else if (logoState === "used") {
+    status = "ok";
+    statusReason = "ロゴ・尺とも CM なしと判定";
+  } else if (found.silences.length === 0) {
+    status = "failed";
+    statusReason = `ロゴが使えず (${logoState})、無音の材料も無い`;
+  } else {
+    status = "degraded";
+    statusReason = `ロゴが使えず (${logoState})、残りの材料でも CM を決められなかった`;
+  }
+  return { cm, duration, note, logoNote, status, statusReason, material };
+}
+
+export interface DiagnoseOptions extends DetectOptions {
+  /** 詳しく見る範囲 (秒) */
+  window?: { start: number; end: number };
+}
+
+/**
+ * 診断モード: 判定そのものではなく「なぜそうなったか」を出す。
+ * 指定範囲について、無音・境目候補・ロゴ区間・秒ごとのロゴの点を並べ、
+ * ロゴ経路と尺経路の両方の結果を返す。材料は detect() と同じ取り方をする。
+ */
+export async function diagnose(input: string, options: DiagnoseOptions): Promise<unknown> {
+  const timeoutMs = options.timeoutMs ?? 30 * 60 * 1000;
+  const probed = await probe(input);
+  const video = { width: probed.width, height: probed.height, duration: probed.duration };
+  const repo = join(options.modelsDir, options.channelKey);
+  const win = options.window ?? { start: 0, end: Math.min(60, probed.duration) };
+  const near = (t: number) => t >= win.start - 10 && t <= win.end + 10;
+
+  let logo: { spans: Array<{ start: number; end: number }>; scores: Float32Array } | null = null;
+  let logoNote = "";
+  const session = await LogoSession.open(input, video, repo, timeoutMs);
+  let found: ScanResult;
+  if (typeof session === "string") {
+    logoNote = `ロゴを覚えられませんでした: ${session}`;
+    found = await scanFile(input, { logo: null, timeoutMs });
+  } else {
+    found = await scanFile(input, { logo: session.scanLogo(), timeoutMs });
+    if (found.times.length > 0 && found.logoFrames === found.times.length) {
+      const result = await session.finish(probed.fps, async (again) => {
+        const rescan = await scanFile(input, { logo: again, audio: false, timeoutMs });
+        return rescan.code;
+      });
+      if (result.code === 0) {
+        logo = { spans: result.spans, scores: result.scores };
+        logoNote = result.note;
+      } else {
+        logoNote = `ロゴ判定に失敗: ${result.note}`;
+      }
+    } else {
+      logoNote = `ロゴの枠の数 (${found.logoFrames}) とコマの数 (${found.times.length}) が合いません`;
+    }
+  }
+
+  const { times } = found;
+  const duration = probed.duration;
+  const at = (frame: number) => (frame < times.length ? times[frame]! : duration);
+  const base = {
+    duration,
+    silences: found.silences,
+    times: Float64Array.from(times),
+    cuts: Float64Array.from(found.cuts),
+    ...(options.programLength !== undefined ? { programLength: options.programLength } : {}),
+    ...(options.programStart !== undefined ? { programStart: options.programStart } : {}),
+  };
+
+  const dumpBoundary = (b: ReturnType<typeof boundaries>[number]) => ({
+    silence: b.silence,
+    cuts: b.cuts.filter(near),
+    weak: b.weak.filter(near),
+    still: b.still,
+  });
+  const inWindow = (b: ReturnType<typeof boundaries>[number]) =>
+    near(b.silence.start) || near(b.silence.end) || b.cuts.some(near);
+
+  // 秒ごとのロゴの点 (範囲内のみ)。コマと時刻の対応が取れているときだけ意味がある
+  const scoreBySecond: Array<{ t: number; mean: number; max: number }> = [];
+  if (logo !== null && found.logoFrames === times.length) {
+    for (let s = Math.floor(win.start); s <= Math.ceil(win.end); s++) {
+      let sum = 0;
+      let max = 0;
+      let n = 0;
+      for (let i = 0; i < times.length; i++) {
+        const t = times[i]!;
+        if (t < s) continue;
+        if (t >= s + 1) break;
+        const v = logo.scores[i] ?? 0;
+        sum += v;
+        if (v > max) max = v;
+        n++;
+      }
+      if (n > 0) scoreBySecond.push({ t: s, mean: Math.round((sum / n) * 100) / 100, max });
+    }
+  }
+
+  const logoSpansSec =
+    logo?.spans.map((s) => ({ start: at(s.start), end: at(s.end + 1) })) ?? [];
+  const withLogo =
+    logo !== null
+      ? decideCm({ ...base, logo: logoSpansSec, logoScores: logo.scores })
+      : null;
+  const plain = decideCm(base);
+
+  return {
+    file: input,
+    duration,
+    fps: probed.fps,
+    size: `${probed.width}x${probed.height}`,
+    programLength: options.programLength ?? null,
+    programStart: options.programStart ?? null,
+    window: win,
+    scan: {
+      code: found.code,
+      frames: times.length,
+      cuts: found.cuts.length,
+      silences: found.silences.length,
+      logoFrames: found.logoFrames,
+    },
+    logoNote,
+    silencesInWindow: found.silences.filter((s) => near(s.start) || near(s.end)),
+    boundariesDefault: boundaries(base).filter(inWindow).map(dumpBoundary),
+    boundariesAlone: boundaries(base, 0.8).filter(inWindow).map(dumpBoundary),
+    logoSpansInWindow: logoSpansSec.filter((s) => s.end >= win.start - 10 && s.start <= win.end + 10),
+    logoScoreBySecond: scoreBySecond,
+    resultWithLogo: withLogo,
+    resultPlain: plain,
+  };
 }

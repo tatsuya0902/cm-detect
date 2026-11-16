@@ -20,7 +20,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { Range } from "./core/cm-decide";
-import { detect } from "./detect";
+import { detect, diagnose, type DetectStatus } from "./detect";
+
+/**
+ * 検出器の版。判定の挙動を変えたら上げる。
+ * 状態ファイルの degraded / failed は、版が変わると 1 回だけ再処理される。
+ */
+const DETECTOR_VERSION = "2026-11-16.1";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOME = homedir();
@@ -91,9 +97,35 @@ async function runDetect(args: string[]): Promise<void> {
       duration: result.duration,
       cm: result.cm,
       note: result.note,
+      status: result.status,
+      statusReason: result.statusReason,
+      material: result.material,
       chapter: out ?? null,
     }),
   );
+}
+
+async function runDiagnose(args: string[]): Promise<void> {
+  const file = args.find((a) => !a.startsWith("--") && a !== "diagnose");
+  if (!file) throw new Error("録画ファイルを指定してください");
+  const channel = argValue(args, "--channel") ?? "unknown";
+  const models = argValue(args, "--models") ?? DEFAULT_MODELS;
+  const windowArg = argValue(args, "--window");
+  let window: { start: number; end: number } | undefined;
+  if (windowArg) {
+    const m = /^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/.exec(windowArg);
+    if (!m) throw new Error(`--window は 開始-終了 (秒) で指定してください: ${windowArg}`);
+    window = { start: Number(m[1]), end: Number(m[2]) };
+  }
+  const dump = await diagnose(file, {
+    modelsDir: models,
+    channelKey: channel.replace(/[^\w.-]+/g, "_"),
+    programLength: argNumber(args, "--program-length"),
+    programStart: argNumber(args, "--program-start"),
+    timeoutMs: argNumber(args, "--timeout-ms"),
+    ...(window ? { window } : {}),
+  });
+  console.log(JSON.stringify(dump, null, 1));
 }
 
 // ---------------- batch ----------------
@@ -111,8 +143,20 @@ interface ApiProgram {
   };
 }
 
+interface StateEntry {
+  at: string;
+  cm: number;
+  note: string;
+  /** 判定の状態。旧形式 (未記録) は ok として扱う */
+  status?: DetectStatus;
+  /** この版で処理を試みた回数 (failed の再試行上限に使う) */
+  attempts?: number;
+  /** 処理した検出器の版 */
+  v?: string;
+}
+
 interface StateFile {
-  files: Record<string, { at: string; cm: number; note: string }>;
+  files: Record<string, StateEntry>;
 }
 
 function loadState(path: string): StateFile {
@@ -180,7 +224,16 @@ async function runBatch(args: string[]): Promise<void> {
     if (!file || video?.status !== "Recorded") continue;
     // NHK (総合・Eテレ・BS) に CM は無いので検出しない
     if ((program.channel?.name ?? "").includes("NHK")) continue;
-    if (state.files[file]) continue;
+    // 状態による再処理の判断: ok は常に対象外。degraded は同じ版では対象外。
+    // failed は同じ版では 3 回まで。版が変わったら degraded / failed を 1 回やり直す
+    const prev = state.files[file];
+    if (prev) {
+      const st = prev.status ?? "ok";
+      const sameVersion = prev.v === DETECTOR_VERSION;
+      if (st === "ok") continue;
+      if (sameVersion && st === "degraded") continue;
+      if (sameVersion && st === "failed" && (prev.attempts ?? 1) >= 3) continue;
+    }
     if (!existsSync(file)) continue;
     const duration = video.duration ?? 0;
     if (duration < 120) continue;
@@ -188,10 +241,19 @@ async function runBatch(args: string[]): Promise<void> {
     if (Date.now() - statSync(file).mtimeMs < 180000) continue;
 
     const chapterPath = file.replace(/\.[^.]+$/, ".chapter.txt");
+    const attempts =
+      prev && prev.v === DETECTOR_VERSION && prev.status !== "ok" ? (prev.attempts ?? 1) + 1 : 1;
     try {
       if (existsSync(chapterPath)) {
         console.log(`[batch] 既存のチャプターを取り込みます: ${file}`);
-        state.files[file] = { at: new Date().toISOString(), cm: -1, note: "既存の .chapter.txt を取り込み" };
+        state.files[file] = {
+          at: new Date().toISOString(),
+          cm: -1,
+          note: "既存の .chapter.txt を取り込み",
+          status: "ok",
+          attempts,
+          v: DETECTOR_VERSION,
+        };
         saveState();
       } else {
         const channelKey = (program.channel?.display_channel_id ?? "unknown").replace(/[^\w.-]+/g, "_");
@@ -202,7 +264,9 @@ async function runBatch(args: string[]): Promise<void> {
           programLength: program.duration,
           programStart: program.recording_start_margin,
         });
-        console.log(`[batch] 結果: CM ${result.cm.length} 区間 / ${result.note}`);
+        console.log(
+          `[batch] 結果: CM ${result.cm.length} 区間 [${result.status}: ${result.statusReason}] / ${result.note}`,
+        );
         if (result.cm.length > 0) {
           writeFileSync(chapterPath, chapterText(result.cm, result.duration), "utf8");
         }
@@ -210,6 +274,9 @@ async function runBatch(args: string[]): Promise<void> {
           at: new Date().toISOString(),
           cm: result.cm.length,
           note: result.note,
+          status: result.status,
+          attempts,
+          v: DETECTOR_VERSION,
         };
         saveState();
       }
@@ -219,7 +286,18 @@ async function runBatch(args: string[]): Promise<void> {
       }
       done++;
     } catch (error) {
-      console.warn(`[batch] 失敗: ${file}: ${error instanceof Error ? error.message : error}`);
+      // 例外も「失敗」として状態に残す (無記録だと毎回無制限に再試行してしまう)
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[batch] 失敗: ${file}: ${message}`);
+      state.files[file] = {
+        at: new Date().toISOString(),
+        cm: 0,
+        note: `例外: ${message}`,
+        status: "failed",
+        attempts,
+        v: DETECTOR_VERSION,
+      };
+      saveState();
     }
   }
   console.log(`[batch] 完了 (${done} 件処理)`);
@@ -228,9 +306,10 @@ async function runBatch(args: string[]): Promise<void> {
 const [command, ...rest] = process.argv.slice(2);
 try {
   if (command === "detect") await runDetect(rest);
+  else if (command === "diagnose") await runDiagnose(rest);
   else if (command === "batch") await runBatch(rest);
   else {
-    console.error("使い方: cm-detect.mjs detect <録画TS> --channel <キー> | batch");
+    console.error("使い方: cm-detect.mjs detect <録画TS> --channel <キー> | diagnose <録画TS> --channel <キー> [--window 開始-終了] | batch");
     process.exit(2);
   }
 } catch (error) {
