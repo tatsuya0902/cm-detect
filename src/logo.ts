@@ -12,7 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Rect } from "./core/logo-area";
@@ -45,37 +45,114 @@ export interface VideoInfo {
 /** 型の置き場のファイル名。コマの大きさごとに分ける (SD と HD が交互に来ても育つように) */
 export const modelFile = (width: number, height: number) => `own-logo-${width}x${height}.bin`;
 
-/** 覚えるときに見るキーフレームの数 */
-const LEARN_FRAMES = 600;
-/** 当てるついでに型へ足すコマの間隔 (コマ数) */
-const GROW_EVERY = 90;
+/**
+ * 型の世代保存 (tobitti0 氏の logoframe の LogoRepository にならう)。
+ * 従来は上の単一ファイルを上書きしていたため、型を「凍結して測る」ことも
+ * 過去の版へ戻すこともできなかった。いまは版番号付きの不変ファイル
+ * `own-logo-<W>x<H>-vNNNN.bin` を追記式に書き、現行版は
+ * `own-logo-<W>x<H>.latest` (1行目: 版数、2行目: ファイル名) が指す。
+ * 直近 KEEP_GENERATIONS 世代だけ残し、古い版は消す。従来の単一ファイルは
+ * 旧版として読みだけ対応する (次に保存される型が v0001 へ引き継ぐ)。
+ */
+export const modelFileVersioned = (width: number, height: number, version: number) =>
+  `own-logo-${width}x${height}-v${String(version).padStart(4, "0")}.bin`;
+export const latestFile = (width: number, height: number) => `own-logo-${width}x${height}.latest`;
+const KEEP_GENERATIONS = 5;
+
+const versionedPattern = (width: number, height: number) =>
+  new RegExp(`^own-logo-${width}x${height}-v(\\d+)\\.bin$`);
+
+/** 版番号付きファイルの版数一覧。読めない置き場は空扱い */
+function listVersions(repo: string, width: number, height: number): number[] {
+  try {
+    const pattern = versionedPattern(width, height);
+    return readdirSync(repo)
+      .map((name) => pattern.exec(name)?.[1])
+      .filter((v): v is string => v !== undefined)
+      .map(Number)
+      .sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** latest ポインタを読む。壊れていれば null (呼び出し側が最大版へ落ちる) */
+function readLatestVersion(repo: string, width: number, height: number): number | null {
+  try {
+    const [versionLine, nameLine] = readFileSync(join(repo, latestFile(width, height)), "utf8").split("\n");
+    const version = Number(versionLine);
+    if (!Number.isInteger(version) || version < 1) return null;
+    if (nameLine?.trim() !== modelFileVersioned(width, height, version)) return null;
+    return version;
+  } catch {
+    return null;
+  }
+}
+
+/** いま使う型ファイルのパス。latest → 最大版 → 従来の単一ファイルの順で探す */
+export function currentModelPath(repo: string, width: number, height: number): string | null {
+  const versions = listVersions(repo, width, height);
+  const latest = readLatestVersion(repo, width, height);
+  if (latest !== null && versions.includes(latest)) {
+    return join(repo, modelFileVersioned(width, height, latest));
+  }
+  if (versions.length > 0) {
+    return join(repo, modelFileVersioned(width, height, versions[versions.length - 1]!));
+  }
+  const legacy = join(repo, modelFile(width, height));
+  return existsSync(legacy) ? legacy : null;
+}
 
 export function loadModel(repo: string, width: number, height: number): LogoModel | null {
   try {
-    const model = decodeModel(readFileSync(join(repo, modelFile(width, height))));
+    const path = currentModelPath(repo, width, height);
+    if (path === null) return null;
+    const model = decodeModel(readFileSync(path));
     return model?.frameWidth === width && model.frameHeight === height ? model : null;
   } catch {
     return null;
   }
 }
 
+/** 原子的に書く (tmp へ書いて rename)。書けなければ例外 */
+function writeAtomic(path: string, bytes: Uint8Array | string): void {
+  const temp = `${path}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`;
+  writeFileSync(temp, bytes);
+  renameSync(temp, path);
+}
+
 /** 型を書く。書けなくても検出は落とさない (次の録画で覚え直せば済む) */
 export function saveModel(repo: string, model: LogoModel): void {
-  const path = join(repo, modelFile(model.frameWidth, model.frameHeight));
-  const temp = `${path}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`;
+  const { frameWidth: width, frameHeight: height } = model;
   try {
     mkdirSync(repo, { recursive: true });
-    writeFileSync(temp, encodeModel(model));
-    renameSync(temp, path);
-  } catch (error) {
-    try {
-      rmSync(temp, { force: true });
-    } catch {
-      // 置き場ごと作れなかった
+    const versions = listVersions(repo, width, height);
+    const latest = readLatestVersion(repo, width, height) ?? 0;
+    // 従来の単一ファイルは版数なしの旧版とみなし、番号は消費しない。
+    // 版付きが1件もなければ初回は v0001 になる。
+    const version = Math.max(0, ...versions, latest) + 1;
+    writeAtomic(join(repo, modelFileVersioned(width, height, version)), encodeModel(model));
+    writeAtomic(
+      join(repo, latestFile(width, height)),
+      `${version}\n${modelFileVersioned(width, height, version)}\n`,
+    );
+    // 直近 KEEP_GENERATIONS 世代だけ残す (消せなくても検出は落とさない)
+    for (const old of listVersions(repo, width, height).slice(0, -KEEP_GENERATIONS)) {
+      try {
+        rmSync(join(repo, modelFileVersioned(width, height, old)), { force: true });
+      } catch {
+        // 残っても害はない
+      }
     }
+  } catch (error) {
     console.warn(`[cm] 覚えたロゴを書けませんでした: ${error}`);
   }
 }
+
+/** 覚えるときに見るキーフレームの数 */
+const LEARN_FRAMES = 600;
+/** 当てるついでに型へ足すコマの間隔 (コマ数) */
+const GROW_EVERY = 90;
 
 function overlaps(a: Rect, b: Rect): boolean {
   return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;

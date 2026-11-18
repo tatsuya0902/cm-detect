@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { modelFile } from "./logo";
+import { currentModelPath, modelFile } from "./logo";
 
 export type ModelStatus = "provisional" | "promoted" | "quarantined";
 
@@ -88,7 +88,9 @@ export function saveRegistry(modelsDir: string, registry: RegistryFile): void {
 /** 型ファイルの指紋。無ければ null */
 export function modelHash(modelsDir: string, channelKey: string, width: number, height: number): string | null {
   try {
-    const bytes = readFileSync(join(modelsDir, channelKey, modelFile(width, height)));
+    const path = currentModelPath(join(modelsDir, channelKey), width, height);
+    if (path === null) return null;
+    const bytes = readFileSync(path);
     return createHash("sha256").update(bytes).digest("hex").slice(0, 12);
   } catch {
     return null;
